@@ -8,10 +8,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 import time
 from pathlib import Path
+
+# Fix Windows cp949 encoding issues with Unicode characters
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from rich.console import Console
 from rich.panel import Panel

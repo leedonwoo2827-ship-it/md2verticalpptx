@@ -27,7 +27,13 @@ def load_slide_index(json_path: str) -> dict:
     """Load slide_index.json and return {slide_number: slide_info} mapping."""
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    return {s['slide_number']: s for s in data.get('slides', [])}
+    slides = data.get('slides', [])
+    # Support both formats:
+    #   [{slide_number: N, shapes: [...], ...}, ...]  (full metadata)
+    #   [0, 1, 2, ...]  (simple number list)
+    if slides and isinstance(slides[0], int):
+        return {n: {} for n in slides}
+    return {s['slide_number']: s for s in slides}
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +233,20 @@ def _find_shape_by_role_hint(text_shapes: list, role_hint: str):
     return None
 
 
+def _fill_table_com(table_com, table_data: dict) -> None:
+    """Fill a COM table object with parsed markdown table data."""
+    all_rows = table_data.get('raw_rows', [])
+    if not all_rows:
+        all_rows = [table_data.get('headers', [])] + table_data.get('rows', [])
+    for ri, row_data in enumerate(all_rows):
+        if ri >= table_com.Rows.Count:
+            break
+        for ci, cell_text in enumerate(row_data):
+            if ci >= table_com.Columns.Count:
+                break
+            replace_table_cell_com(table_com, ri + 1, ci + 1, str(cell_text))
+
+
 def apply_fields_com(slide_com, slide_info: dict, fields: dict, tables: list | None = None) -> None:
     """Apply field data to a PowerPoint COM slide via shape name matching."""
     role_map = slide_info.get('role_map', {})
@@ -269,17 +289,61 @@ def apply_fields_com(slide_com, slide_info: dict, fields: dict, tables: list | N
                     applied_fields.add(role_name)
 
     # Card table replacement (카드N_제목, 카드N_내용)
+    card_fields = sorted([k for k in fields if k.startswith('카드') and '_제목' in k])
     card_indices = role_map.get('card_table', [])
-    for card_num, si in enumerate(card_indices, 1):
-        title_key = f'카드{card_num}_제목'
-        content_key = f'카드{card_num}_내용'
-        shape = get_com_shape(si)
-        if shape and shape.HasTable:
-            table = shape.Table
-            if title_key in fields and table.Rows.Count >= 1:
+    if card_indices:
+        for card_num, si in enumerate(card_indices, 1):
+            title_key = f'카드{card_num}_제목'
+            content_key = f'카드{card_num}_내용'
+            shape = get_com_shape(si)
+            if shape and shape.HasTable:
+                table = shape.Table
+                if title_key in fields and table.Rows.Count >= 1:
+                    replace_table_cell_com(table, 1, 1, fields[title_key])
+                if content_key in fields and table.Rows.Count >= 2:
+                    replace_table_cell_com(table, 2, 1, fields[content_key])
+                applied_fields.add(title_key)
+                applied_fields.add(content_key)
+    elif card_fields:
+        # Fallback: find small card tables (2 rows) in slide order
+        card_tables = []
+        for i in range(1, shapes_com.Count + 1):
+            try:
+                s = shapes_com(i)
+                if s.HasTable and s.Table.Rows.Count == 2 and s.Table.Columns.Count == 1:
+                    card_tables.append(s)
+            except Exception:
+                pass
+        for card_num, _ in enumerate(card_tables, 1):
+            title_key = f'카드{card_num}_제목'
+            content_key = f'카드{card_num}_내용'
+            table = card_tables[card_num - 1].Table
+            if title_key in fields:
                 replace_table_cell_com(table, 1, 1, fields[title_key])
-            if content_key in fields and table.Rows.Count >= 2:
+                applied_fields.add(title_key)
+            if content_key in fields:
                 replace_table_cell_com(table, 2, 1, fields[content_key])
+                applied_fields.add(content_key)
+        # Also replace adjacent Rectangle (card content text) if present
+        # S3006 pattern: Rectangle N (content) → 표 33 (card) → Rectangle M (number)
+        # The large Rectangle before each card table holds content text
+        card_content_rects = []
+        for i in range(1, shapes_com.Count + 1):
+            try:
+                s = shapes_com(i)
+                if s.HasTextFrame and not s.HasTable and s.Type == 1:  # msoAutoShape
+                    w = s.Width
+                    if w > 300:  # large content rectangle
+                        t = s.TextFrame.TextRange.Text
+                        if '████' in t:
+                            card_content_rects.append(s)
+            except Exception:
+                pass
+        for card_num, rect in enumerate(card_content_rects, 1):
+            content_key = f'카드{card_num}_내용'
+            if content_key in fields:
+                replace_shape_text_com(rect, fields[content_key])
+                applied_fields.add(content_key)
 
     # text_content replacement (backward compat)
     for t_num, si in enumerate(role_map.get('text_content', []), 1):
@@ -292,49 +356,120 @@ def apply_fields_com(slide_com, slide_info: dict, fields: dict, tables: list | N
     # Data table replacement
     if tables:
         dt_indices = role_map.get('data_table', [])
-        for ti, table_data in enumerate(tables):
-            if ti < len(dt_indices):
-                si = dt_indices[ti]
-                shape = get_com_shape(si)
-                if shape and shape.HasTable:
-                    all_rows = table_data.get('raw_rows', [])
-                    if not all_rows:
-                        all_rows = [table_data.get('headers', [])] + table_data.get('rows', [])
-                    table_com = shape.Table
-                    for ri, row_data in enumerate(all_rows):
-                        if ri >= table_com.Rows.Count:
-                            break
-                        for ci, cell_text in enumerate(row_data):
-                            if ci >= table_com.Columns.Count:
-                                break
-                            replace_table_cell_com(table_com, ri + 1, ci + 1, str(cell_text))
-
-    # Fallback: match remaining fields via group-internal search
-    remaining = {k: v for k, v in fields.items() if k not in applied_fields}
-    if remaining:
-        if 'governing_message' in remaining:
-            shape = _find_shape_by_role_hint(all_text_shapes, 'governing_message')
-            if shape:
-                replace_shape_text_com(shape, remaining.pop('governing_message'))
-
-        if 'breadcrumb' in remaining:
-            shape = _find_shape_by_role_hint(all_text_shapes, 'breadcrumb')
-            if shape:
-                replace_shape_text_com(shape, remaining.pop('breadcrumb'))
-
-        content_fields = sorted([k for k in remaining if k.startswith('content_')])
-        if content_fields:
-            available = []
-            for shape in all_text_shapes:
+        if dt_indices:
+            # Use role_map indices
+            for ti, table_data in enumerate(tables):
+                if ti < len(dt_indices):
+                    si = dt_indices[ti]
+                    shape = get_com_shape(si)
+                    if shape and shape.HasTable:
+                        _fill_table_com(shape.Table, table_data)
+        else:
+            # Fallback: find table shapes in the slide
+            table_shapes = []
+            for i in range(1, shapes_com.Count + 1):
                 try:
-                    t = shape.TextFrame.TextRange.Text
-                    if t and '████' in t:
-                        available.append(shape)
+                    s = shapes_com(i)
+                    if s.HasTable:
+                        table_shapes.append(s)
                 except Exception:
                     pass
-            for i, key in enumerate(content_fields):
-                if i < len(available):
-                    replace_shape_text_com(available[i], remaining[key])
+            for ti, table_data in enumerate(tables):
+                if ti < len(table_shapes):
+                    _fill_table_com(table_shapes[ti].Table, table_data)
+
+    # Fallback: match remaining fields via shape name / text scanning
+    remaining = {k: v for k, v in fields.items() if k not in applied_fields}
+    if not remaining:
+        return
+
+    replaced_shapes: set[int] = set()  # track replaced shape ids
+
+    # --- 1. governing_message → 부제목/subtitle shape ---
+    if 'governing_message' in remaining:
+        for shape in all_text_shapes:
+            try:
+                sname = shape.Name.lower()
+                if '부제목' in sname or 'subtitle' in sname:
+                    if replace_shape_text_com(shape, remaining['governing_message']):
+                        replaced_shapes.add(id(shape))
+                        remaining.pop('governing_message')
+                        break
+            except Exception:
+                pass
+
+    # --- 2. breadcrumb → 제목 (not 부제목) shape ---
+    if 'breadcrumb' in remaining:
+        for shape in all_text_shapes:
+            if id(shape) in replaced_shapes:
+                continue
+            try:
+                sname = shape.Name.lower()
+                if ('제목' in sname and '부제목' not in sname) or \
+                   ('title' in sname and 'subtitle' not in sname):
+                    if replace_shape_text_com(shape, remaining['breadcrumb']):
+                        replaced_shapes.add(id(shape))
+                        remaining.pop('breadcrumb')
+                        break
+            except Exception:
+                pass
+
+    # --- 3. section_title ---
+    if 'section_title' in remaining:
+        for shape in all_text_shapes:
+            if id(shape) in replaced_shapes:
+                continue
+            try:
+                sname = shape.Name.lower()
+                if '절제목' in sname or 'section' in sname:
+                    if replace_shape_text_com(shape, remaining['section_title']):
+                        replaced_shapes.add(id(shape))
+                        remaining.pop('section_title')
+                        break
+            except Exception:
+                pass
+
+    # --- 4. content_N → largest ████ shapes (sorted by area descending) ---
+    content_fields = sorted([k for k in remaining if k.startswith('content_')])
+    if content_fields:
+        candidates = []
+        for shape in all_text_shapes:
+            if id(shape) in replaced_shapes:
+                continue
+            try:
+                t = shape.TextFrame.TextRange.Text
+                if not t or '████' not in t:
+                    continue
+                sname = shape.Name.lower()
+                # Skip header shapes (already handled above)
+                if '부제목' in sname or 'subtitle' in sname:
+                    continue
+                # Calculate area for sorting
+                try:
+                    area = shape.Width * shape.Height
+                except Exception:
+                    area = 0
+                candidates.append((area, shape))
+            except Exception:
+                pass
+        # Sort by area: largest first
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for i, key in enumerate(content_fields):
+            if i < len(candidates):
+                if replace_shape_text_com(candidates[i][1], remaining[key]):
+                    replaced_shapes.add(id(candidates[i][1]))
+                    remaining.pop(key, None)
+
+    # --- 5. Clear unreplaced ████ placeholder blocks ---
+    for shape in all_text_shapes:
+        if id(shape) in replaced_shapes:
+            continue
+        try:
+            t = shape.TextFrame.TextRange.Text
+            if t and '████' in t:
+                shape.TextFrame.TextRange.Text = ''
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -404,8 +539,15 @@ def build_single_slide(
         if fields or tables:
             apply_fields_com(prs.Slides(1), slide_info, fields, tables)
 
-        if write_notes and note:
-            set_slide_notes(prs.Slides(1), note)
+        if write_notes:
+            # Build full note: all field values + @note
+            note_parts = []
+            for fk, fv in slide.fields.items():
+                note_parts.append(f'@{fk}: {fv}')
+            if note:
+                note_parts.append(f'@note: {note}')
+            if note_parts:
+                set_slide_notes(prs.Slides(1), '\n\n'.join(note_parts))
 
         prs.Save()
         prs.Close()
