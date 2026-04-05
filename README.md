@@ -92,6 +92,51 @@ python -m md2pptx <body.md> -t <templates_dir> [-o output.pptx]
 
 ## 실행 예시
 
+### 실제 프로젝트 실행 (세로형 PPTX 생성)
+
+작업 폴더 구조가 아래와 같을 때:
+
+```
+260405-1/
+├── proposal-body-part3.md      # 입력 마크다운
+├── slide_index_part3.json      # 슬라이드 인덱스
+├── templates/
+│   └── slides/                 # S*.pptx 템플릿 (175개)
+│       ├── S2001.pptx
+│       ├── S2002.pptx
+│       └── ...
+└── output/                     # 결과물 저장
+```
+
+**Windows (CMD):**
+
+```cmd
+cd C:\Users\leedonwoo\Documents\pro2ppt\260405-1
+
+:: 1. slide_index.json을 템플릿 폴더에 복사
+copy slide_index_part3.json templates\slides\slide_index.json
+
+:: 2. md2pptx 실행
+python -m md2pptx proposal-body-part3.md -t templates\slides -o output\part3-사업관리부문.pptx --continue-on-error -v
+```
+
+**Windows (PowerShell):**
+
+```powershell
+cd C:\Users\leedonwoo\Documents\pro2ppt\260405-1
+
+# 1. slide_index.json을 템플릿 폴더에 복사
+Copy-Item slide_index_part3.json templates\slides\slide_index.json
+
+# 2. md2pptx 실행
+python -m md2pptx proposal-body-part3.md -t templates\slides -o output\part3-사업관리부문.pptx --continue-on-error -v
+```
+
+> **참고**: `slide_index.json`은 `-t` 템플릿 디렉토리 안에 있어야 합니다.
+> 루트에 별도 파일(`slide_index_part3.json`)이 있는 경우, 위처럼 복사 후 실행하세요.
+
+### 기본 사용법
+
 ```bash
 # 기본 사용
 python -m md2pptx proposal-body-part2.md -t ./templates/slides -o output/part2.pptx
